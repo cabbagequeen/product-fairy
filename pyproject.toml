@@ -1,0 +1,14 @@
+[project]
+name = "product-image-generator"
+version = "1.0.0"
+description = "Generate professional product images using Google Gemini AI"
+requires-python = ">=3.9"
+dependencies = [
+    "google-genai>=0.2.0",
+    "pandas>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

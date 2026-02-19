@@ -1,0 +1,4 @@
+ProductNumber,GenderCode,ColorCode,ProductName,ColorName,FlatLayPrompt
+CNC-P1000,M,NAV,Seaside Performance Polo,Navy Blue,"Generate a professional product photo of a navy blue men's polo shirt, flat lay on pure white background, studio lighting, clean minimal style, high-end retail photography"
+CNC-P1001,F,WHT,Coastal Breeze Blouse,White,"Generate a professional product photo of a white women's blouse, flat lay on pure white background, studio lighting, clean minimal style, high-end retail photography"
+CNC-P1002,U,BLK,Urban Classic Tee,Black,"Generate a professional product photo of a black unisex t-shirt, flat lay on pure white background, studio lighting, clean minimal style, high-end retail photography"
