@@ -887,6 +887,7 @@ class ShopifyPushRequest(BaseModel):
     products: List[Dict[str, Any]]
     brand: Optional[Dict[str, Any]] = None
     images: Dict[str, str]  # filename -> base64 image data
+    location_id: Optional[str] = None  # Shopify location ID (numeric) for inventory
 
 
 async def shopify_graphql(
@@ -997,7 +998,6 @@ async def create_shopify_product(
     product_type: str,
     variants_data: List[dict],
     media_urls: List[dict],
-    location_id: Optional[str] = None,
 ) -> dict:
     """Create a product with variants and media using the productSet mutation.
 
@@ -1016,6 +1016,9 @@ async def create_shopify_product(
               id
               title
               sku
+              inventoryItem {
+                id
+              }
             }
           }
         }
@@ -1035,16 +1038,8 @@ async def create_shopify_product(
             "optionValues": [{"optionName": "Color", "name": v["color_name"]}],
             "price": str(v.get("price", "0.00")),
             "sku": v.get("sku", ""),
+            "inventoryItem": {"tracked": True},
         }
-        # Set inventory if we have a location ID
-        if location_id and v.get("inventory", 0) > 0:
-            variant_input["inventoryQuantities"] = [
-                {
-                    "locationId": location_id,
-                    "name": "available",
-                    "quantity": v["inventory"],
-                }
-            ]
         variant_inputs.append(variant_input)
 
     # Build file inputs from staged upload resource URLs
@@ -1097,6 +1092,66 @@ async def create_shopify_product(
         raise ValueError("Product creation returned null — check API version and mutation input")
 
     return product
+
+
+async def activate_inventory_at_location(
+    client: httpx.AsyncClient,
+    store_url: str,
+    access_token: str,
+    inventory_item_id: str,
+    location_id: str,
+    quantity: int,
+) -> None:
+    """Activate an inventory item at a location, then set the available quantity."""
+    # Step 1: Activate (stock) the inventory item at this location
+    activate_query = """
+    mutation inventoryActivate($inventoryItemId: ID!, $locationId: ID!) {
+      inventoryActivate(inventoryItemId: $inventoryItemId, locationId: $locationId) {
+        inventoryLevel { id }
+        userErrors { field message }
+      }
+    }
+    """
+    result = await shopify_graphql(
+        client, store_url, access_token, activate_query,
+        {"inventoryItemId": inventory_item_id, "locationId": location_id},
+    )
+    logger.warning("[shopify] inventoryActivate response: %s", json.dumps(result, default=str)[:500])
+    activate_data = (result.get("data") or {}).get("inventoryActivate") or {}
+    if activate_data.get("userErrors"):
+        logger.warning("[shopify] inventoryActivate userErrors (non-fatal): %s", activate_data["userErrors"])
+
+    # Step 2: Set the available quantity
+    if quantity > 0:
+        set_query = """
+        mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
+          inventorySetQuantities(input: $input) {
+            inventoryAdjustmentGroup { createdAt }
+            userErrors { field message }
+          }
+        }
+        """
+        set_vars = {
+            "input": {
+                "reason": "correction",
+                "name": "available",
+                "ignoreCompareQuantity": True,
+                "quantities": [
+                    {
+                        "inventoryItemId": inventory_item_id,
+                        "locationId": location_id,
+                        "quantity": quantity,
+                    }
+                ],
+            }
+        }
+        result = await shopify_graphql(client, store_url, access_token, set_query, set_vars)
+        logger.warning("[shopify] inventorySetQuantities response: %s", json.dumps(result, default=str)[:500])
+        set_data = (result.get("data") or {}).get("inventorySetQuantities") or {}
+        if set_data.get("userErrors"):
+            logger.warning("[shopify] inventorySetQuantities userErrors: %s", set_data["userErrors"])
+        else:
+            logger.warning("[shopify] Inventory set: item=%s, location=%s, qty=%d", inventory_item_id, location_id, quantity)
 
 
 async def publish_product(
@@ -1195,14 +1250,30 @@ async def push_to_shopify_stream(request: ShopifyPushRequest):
             try:
                 loc_result = await shopify_graphql(
                     client, store_url, access_token,
-                    "{ locations(first: 1) { nodes { id name } } }",
+                    "{ locations(first: 5) { nodes { id name isActive } } }",
                 )
                 locations = (loc_result.get("data") or {}).get("locations", {}).get("nodes", [])
                 if locations:
                     location_id = locations[0]["id"]
                     logger.warning("[shopify-push] Using location: %s (%s)", locations[0].get("name"), location_id)
+                else:
+                    # Query was denied or returned empty — fall back to getting location
+                    # from an inventory item on an existing product
+                    logger.warning("[shopify-push] Locations query returned no data (likely ACCESS_DENIED), trying fallback...")
+                    fallback_result = await shopify_graphql(
+                        client, store_url, access_token,
+                        "{ shop { id name } }",
+                    )
+                    logger.warning("[shopify-push] Shop query: %s", json.dumps(fallback_result, default=str)[:300])
             except Exception as e:
-                logger.warning("[shopify-push] Could not fetch locations (inventory will be skipped): %s", e)
+                logger.warning("[shopify-push] Could not fetch locations: %s", e)
+
+            # If we still don't have a location, try to get it from the first created product's inventory
+            # by creating a temporary product, reading its inventory level, then deleting it.
+            # For now, use a provided location_id if available in the request.
+            if not location_id and hasattr(request, 'location_id') and request.location_id:
+                location_id = f"gid://shopify/Location/{request.location_id}"
+                logger.warning("[shopify-push] Using provided location_id: %s", location_id)
 
             created_count = 0
 
@@ -1279,9 +1350,23 @@ async def push_to_shopify_stream(request: ShopifyPushRequest):
                         product_type=product_type,
                         variants_data=variants_data,
                         media_urls=media_urls,
-                        location_id=location_id,
                     )
                     logger.warning("[shopify-push] Product created: id=%s, handle=%s", product.get("id"), product.get("handle"))
+
+                    # Activate inventory at the location for each variant
+                    if location_id:
+                        created_variants = (product.get("variants") or {}).get("nodes") or []
+                        for vi, cv in enumerate(created_variants):
+                            inv_item_id = (cv.get("inventoryItem") or {}).get("id")
+                            qty = variants_data[vi]["inventory"] if vi < len(variants_data) else 0
+                            if inv_item_id:
+                                try:
+                                    await activate_inventory_at_location(
+                                        client, store_url, access_token,
+                                        inv_item_id, location_id, qty,
+                                    )
+                                except Exception as inv_err:
+                                    logger.warning("[shopify-push] Inventory activation failed for %s: %s", cv.get("sku"), inv_err)
 
                     product_gid = product.get("id")
                     if product_gid:

@@ -99,7 +99,9 @@ export default function ShopifyConnect({
       detail: (
         <>
           Go to <strong>Versions</strong> tab \u2192 add{' '}
-          <code className="bg-gray-100 px-1 py-0.5 rounded text-xs">write_products</code> scope \u2192 Release
+          <code className="bg-gray-100 px-1 py-0.5 rounded text-xs">write_products</code>,{' '}
+          <code className="bg-gray-100 px-1 py-0.5 rounded text-xs">write_inventory</code>,{' '}
+          <code className="bg-gray-100 px-1 py-0.5 rounded text-xs">read_locations</code> scopes \u2192 Release
         </>
       ),
     },
